@@ -1,0 +1,256 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- ENUMS ----------
+
+enum PropertyType {
+  LAND
+  HOUSE
+  HOUSE_WITH_LAND
+}
+
+enum RoadWidthUnit {
+  FEET
+  METERS
+}
+
+enum LandExtentUnit {
+  PERCHES
+  ACRES
+}
+
+enum RoadAccess {
+  DIRECT
+  PRIVATE
+  SHARED
+  OTHER
+}
+
+enum LandCondition {
+  FLAT
+  SLOPED
+}
+
+enum NearbyPlaceType {
+  SCHOOL
+  RAILWAY_STATION
+  BUS_STOP
+  MAIN_ROAD
+  HOSPITAL
+  PHARMACY
+  MOSQUE
+  HINDU_TEMPLE
+  BUDDHIST_TEMPLE
+  CHURCH
+}
+
+enum PropertyStatus {
+  DRAFT
+  PUBLISHED
+  DEACTIVATED
+  UNDER_REVIEW
+  POSSIBLE_DUPLICATE
+}
+
+enum DuplicateCheckResult {
+  LOW_DUPLICATE_RISK
+  POSSIBLE_DUPLICATE
+  OCR_UNCERTAIN
+}
+
+// ---------- MODELS ----------
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  properties    Property[]
+  refreshTokens RefreshToken[]
+
+  @@map("users")
+}
+
+// Opaque refresh tokens (random bytes, hashed at rest) rather than JWTs so a
+// session can be revoked/rotated server-side — a stateless refresh JWT
+// can't be invalidated before it expires.
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model Property {
+  id       String @id @default(uuid())
+  sellerId String
+  seller   User   @relation(fields: [sellerId], references: [id])
+
+  // Only `type` is required at creation (wizard step 2, right after auth).
+  // Every other wizard-collected field below is nullable because the
+  // seller fills them in progressively across later steps — including
+  // image/deed uploads that need a propertyId to attach to — and can save
+  // a draft at any point. Completeness is enforced at publish time instead
+  // (see properties.service.ts publishProperty).
+  type PropertyType
+
+  roadWidth     Decimal?      @db.Decimal(6, 2)
+  roadWidthUnit RoadWidthUnit @default(FEET)
+  roadAccess    RoadAccess?
+
+  landCondition LandCondition?
+
+  landExtent     Decimal?       @db.Decimal(10, 2)
+  landExtentUnit LandExtentUnit @default(PERCHES)
+
+  price       Decimal? @db.Decimal(14, 2)
+  description String?
+
+  latitude  Decimal? @db.Decimal(9, 6)
+  longitude Decimal? @db.Decimal(9, 6)
+
+  // Data-driven region tag (not a DB enum) so future regions are a data
+  // change, not a schema migration. MVP only ever writes "KANDY" here.
+  region String @default("KANDY")
+
+  status PropertyStatus @default(DRAFT)
+
+  // Contact number for buyers to reach the seller about this specific
+  // listing. Entered by the seller during the wizard, not tied to their
+  // login identity (login is by email) — no OTP verification required.
+  contactPhoneNumber String?
+
+  // Set only once the seller has explicitly confirmed the phone-visibility
+  // notice at publish time (product spec §28/§54).
+  phoneVisibilityConfirmedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  images          PropertyImage[]
+  deed            DeedDocument?
+  nearbyPlaces    PropertyNearbyPlace[]
+  duplicateChecks DuplicateCheck[]
+
+  @@index([status, region])
+  @@index([sellerId])
+  @@map("properties")
+}
+
+model PropertyImage {
+  id         String   @id @default(uuid())
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  // Object storage key, not a raw public URL — the API derives the served
+  // URL at response time so storage location changes need no data migration.
+  storageKey String
+  isPrimary  Boolean @default(false)
+  sortOrder  Int     @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@index([propertyId])
+  @@map("property_images")
+}
+
+// Private by construction: never selected into any public property response.
+model DeedDocument {
+  id         String   @id @default(uuid())
+  propertyId String   @unique
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  storageKey    String
+  mimeType      String
+  fileSizeBytes Int
+
+  ocrText       String?
+  ocrConfidence Decimal? @db.Decimal(4, 3)
+
+  extractedDeedNumber String?
+  extractedOwnerName  String?
+  extractedExtent     String?
+  extractedPlanNumber String?
+
+  fingerprint String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("deed_documents")
+}
+
+// Master list of real-world places, shared across properties so the same
+// mosque/school isn't duplicated per listing (product spec §17).
+model NearbyPlace {
+  id              String          @id @default(uuid())
+  type            NearbyPlaceType
+  name            String
+  latitude        Decimal         @db.Decimal(9, 6)
+  longitude       Decimal         @db.Decimal(9, 6)
+  externalPlaceId String?
+
+  createdAt DateTime @default(now())
+
+  properties PropertyNearbyPlace[]
+
+  @@index([type])
+  @@map("nearby_places")
+}
+
+// Join table: which places a seller selected for a property, plus the
+// server-calculated distance from the property's exact location.
+model PropertyNearbyPlace {
+  id String @id @default(uuid())
+
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  nearbyPlaceId String
+  nearbyPlace   NearbyPlace @relation(fields: [nearbyPlaceId], references: [id])
+
+  // Denormalized so buyer nearby-facility filters don't need a join.
+  type           NearbyPlaceType
+  distanceMeters Int
+
+  createdAt DateTime @default(now())
+
+  @@unique([propertyId, nearbyPlaceId])
+  @@index([propertyId])
+  @@index([type])
+  @@map("property_nearby_places")
+}
+
+// Append-only audit log: one row per duplicate-detection run, so history is
+// preserved for admin review and re-checks (never a single mutable field).
+model DuplicateCheck {
+  id         String   @id @default(uuid())
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  result            DuplicateCheckResult
+  matchedPropertyId String?
+  similarityScore   Decimal?             @db.Decimal(5, 4)
+
+  reviewedByAdmin Boolean   @default(false)
+  reviewedAt      DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([propertyId])
+  @@map("duplicate_checks")
+}
